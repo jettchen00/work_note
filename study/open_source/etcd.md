@@ -1,3 +1,22 @@
+[toc]
+# 参考文档
+[彻底搞懂mvcc与watch](https://zhuanlan.zhihu.com/p/502786815)
+[boltdb 源码导读-数据组织](https://zhuanlan.zhihu.com/p/332439403)
+[boltdb 源码导读-索引设计](https://zhuanlan.zhihu.com/p/341416264)
+[boltdb 源码导读-事务实现](https://zhuanlan.zhihu.com/p/363795675)
+[自底向上分析 BoltDB 源码](https://www.bookstack.cn/books/jaydenwen123-boltdb_book)
+[boltdb源码阅读](https://mp.weixin.qq.com/s/QfcHJ7dazjRUSC3vCMuofQ)
+[Etcd Raft库的日志存储](https://www.codedump.info/post/20210628-etcd-wal/)
+[Etcd Raft库的工程化实现](https://www.codedump.info/post/20210515-raft/)
+[etcd中的Lease机制](https://www.cnblogs.com/ricklz/p/15232204.html)
+[万字长文解析 etcd 如何实现 watch 机制](https://zhuanlan.zhihu.com/p/502786815)
+[watch机制原理分析](https://www.lixueduan.com/post/etcd/05-watch/)
+[watch 机制源码分析](https://www.lixueduan.com/post/etcd/13-watch-analyze-1/)
+[Raft成员变更的工程实践](https://zhuanlan.zhihu.com/p/359206808)
+[etcd 3.5版本的joint consensus实现解析](https://www.codedump.info/post/20220101-etcd3.5-joint-consensus/)
+[etcd-raft的线性一致读](https://zhuanlan.zhihu.com/p/31050303)
+
+
 # 一. 配置相关
 1. 在启动etcd的时候，所有需要支持的配置项，首先需要在func newConfig() *config函数中通过以下函数初始化好每一个配置项的名称以及默认值，如下例子所示
 ```
@@ -65,7 +84,7 @@ if err = e.serveMetrics(); err != nil {
     5.9： func stepCandidate(r *raft, m pb.Message)函数会处理投票回包。多数派同意，则通过func (r *raft) becomeLeader()函数切换到leader状态
 
 
-## 四. 集群间的网络通信
+# 四. 集群间的网络通信
 1. 集群节点的配置：通过将如下所示的配置项存储到cfg.ec.InitialCluster中，然后通过urlsmap, token, err = cfg.PeerURLsMapAndToken("etcd")函数将成员节点的name和url存储到urlsmap，再通过cl, err = membership.NewClusterFromURLsMap(cfg.Logger, cfg.InitialClusterToken, cfg.InitialPeerURLsMap)函数生成RaftCluster的对象cl，这里cfg.InitialPeerURLsMap其实就是前面的urlsmap。
 ```
 --initial-cluster 'infra1=http://127.0.0.1:12380,infra2=http://127.0.0.1:22380,infra3=http://127.0.0.1:32380'
@@ -502,7 +521,432 @@ func (t *Transport) Handler() http.Handler {
 }
 ```
 
-# 1. 写请求的处理流程
+# 五. 数据存储
+1. etcd v2版本：只保存了key的最新的value，之前的value会被直接覆盖，如果需要知道一个key的历史记录，需要对该key维护一个历史变更的窗口，默认保存最新的1000个变更，但是当数据更新较快时，这1000个变更其实“不够用”，因为数据会被快速覆盖，之前的记录还是找不到。
+2. etcd v3版本：etcd v3摒弃了v2不稳定的“滑动窗口”式设计，引入MVCC机制，采用从历史记录为主索引的存储结构，保存了key的所有历史记录变更，并支持数据在无锁状态下的的快速查询。由于etcd v3实现了MVCC，保存了每个key-value pair的历史版本，数据了大了很多，不能将整个数据库都存放到内存中。因此etcd v3摒弃了内存数据库，转为磁盘数据库，即整个数据都存储在磁盘上，底层的存储引擎使用的是BoltDB。
+[Etcd V2与V3版本比较](https://zhuanlan.zhihu.com/p/369782579)
+[Etcd V2与V3存储差异](https://zhuanlan.zhihu.com/p/271232304)
+3. 应用状态机初始化的代码流程如下：
+```
+srv.kv = mvcc.New(srv.getLogger(), srv.be, srv.lessor, srv.consistIndex, mvcc.StoreConfig{CompactionBatchLimit: cfg.CompactionBatchLimit})
+
+srv.applyV2 = NewApplierV2(cfg.Logger, srv.v2store, srv.cluster)
+
+srv.applyV3Base = srv.newApplierV3Backend()
+srv.applyV3Internal = srv.newApplierV3Internal()
+if err = srv.restoreAlarms(); err != nil {
+    return nil, err
+}
+
+func (s *EtcdServer) restoreAlarms() error {
+    s.applyV3 = s.newApplierV3()
+    as, err := v3alarm.NewAlarmStore(s.lg, s)
+    if err != nil {
+        return err
+    }
+    s.alarmStore = as
+    if len(as.Get(pb.AlarmType_NOSPACE)) > 0 {
+        s.applyV3 = newApplierV3Capped(s.applyV3)
+    }
+    if len(as.Get(pb.AlarmType_CORRUPT)) > 0 {
+        s.applyV3 = newApplierV3Corrupt(s.applyV3)
+    }
+    return nil
+}
+```
+4. 后端存储初始化的代码流程如下：
+```
+func newBackend(bcfg BackendConfig) *backend {
+    if bcfg.Logger == nil {
+        bcfg.Logger = zap.NewNop()
+    }
+
+    bopts := &bolt.Options{}
+    if boltOpenOptions != nil {
+        *bopts = *boltOpenOptions
+    }
+    bopts.InitialMmapSize = bcfg.mmapSize()
+    bopts.FreelistType = bcfg.BackendFreelistType
+    bopts.NoSync = bcfg.UnsafeNoFsync
+    bopts.NoGrowSync = bcfg.UnsafeNoFsync
+
+    db, err := bolt.Open(bcfg.Path, 0600, bopts)
+    if err != nil {
+        bcfg.Logger.Panic("failed to open database", zap.String("path", bcfg.Path), zap.Error(err))
+    }
+
+    // In future, may want to make buffering optional for low-concurrency systems
+    // or dynamically swap between buffered/non-buffered depending on workload.
+    b := &backend{
+        db: db,
+
+        batchInterval: bcfg.BatchInterval,
+        batchLimit:    bcfg.BatchLimit,
+
+        readTx: &readTx{
+            buf: txReadBuffer{
+                txBuffer: txBuffer{make(map[string]*bucketBuffer)},
+            },
+            buckets: make(map[string]*bolt.Bucket),
+            txWg:    new(sync.WaitGroup),
+        },
+
+        stopc: make(chan struct{}),
+        donec: make(chan struct{}),
+
+        lg: bcfg.Logger,
+    }
+    b.batchTx = newBatchTxBuffered(b)
+    go b.run()
+    return b
+}
+```
+5. 数据写入的代码流程如下：
+```
+func (a *applierV3backend) Apply(r *pb.InternalRaftRequest) *applyResult
+
+func (aa *authApplierV3) Put(ctx context.Context, txn mvcc.TxnWrite, r *pb.PutRequest) (*pb.PutResponse, *traceutil.Trace, error)
+
+func (a *quotaApplierV3) Put(ctx context.Context, txn mvcc.TxnWrite, p *pb.PutRequest) (*pb.PutResponse, *traceutil.Trace, error)
+
+func (a *applierV3backend) Put(ctx context.Context, txn mvcc.TxnWrite, p *pb.PutRequest) (resp *pb.PutResponse, trace *traceutil.Trace, err error)
+
+func (s *watchableStore) Write(trace *traceutil.Trace) TxnWrite {
+    return &watchableStoreTxnWrite{s.store.Write(trace), s}
+}
+
+func (s *store) Write(trace *traceutil.Trace) TxnWrite {
+    s.mu.RLock()
+    tx := s.b.BatchTx()
+    tx.Lock()
+    tw := &storeTxnWrite{
+        storeTxnRead: storeTxnRead{s, tx, 0, 0, trace},
+        tx:           tx,
+        beginRev:     s.currentRev,
+        changes:      make([]mvccpb.KeyValue, 0, 4),
+    }
+    return newMetricsTxnWrite(tw)
+}
+
+func (tw *storeTxnWrite) Put(key, value []byte, lease lease.LeaseID)
+
+func (t *batchTxBuffered) UnsafeSeqPut(bucketName []byte, key []byte, value []byte)
+
+func (t *batchTx) UnsafeSeqPut(bucketName []byte, key []byte, value []byte)
+
+// t.tx这个变量是通过func (b *backend) begin(write bool) *bolt.Tx函数得到的
+func (t *batchTx) unsafePut(bucketName []byte, key []byte, value []byte, seq bool) {
+    bucket := t.tx.Bucket(bucketName)
+    if bucket == nil {
+        t.backend.lg.Fatal(
+            "failed to find a bucket",
+            zap.String("bucket-name", string(bucketName)),
+        )
+    }
+    if seq {
+        // it is useful to increase fill percent when the workloads are mostly append-only.
+        // this can delay the page split and reduce space usage.
+        bucket.FillPercent = 0.9
+    }
+    if err := bucket.Put(key, value); err != nil {
+        t.backend.lg.Fatal(
+            "failed to write to a bucket",
+            zap.String("bucket-name", string(bucketName)),
+            zap.Error(err),
+        )
+    }
+    t.pending++
+}
+```
+6. 数据压缩
+&emsp;&emsp;启动压缩goroutine，代码如下：
+```
+if num := cfg.AutoCompactionRetention; num != 0 {
+        srv.compactor, err = v3compactor.New(cfg.Logger, cfg.AutoCompactionMode, num, srv.kv, srv)
+        if err != nil {
+            return nil, err
+        }
+        srv.compactor.Run()
+    }
+```
+&emsp;&emsp;压缩的函数执行调用栈如下：
+```
+1. pc.c.Compact(pc.ctx, &pb.CompactionRequest{Revision: rev})
+
+2. func (s *EtcdServer) Compact(ctx context.Context, r *pb.CompactionRequest) (*pb.CompactionResponse, error)
+
+3. ar.resp, ar.physc, ar.trace, ar.err = a.s.applyV3.Compaction(r.Compaction)
+
+4. func (a *applierV3backend) Compaction(compaction *pb.CompactionRequest) (*pb.CompactionResponse, <-chan struct{}, *traceutil.Trace, error)
+
+5. ch, err := a.s.KV().Compact(trace, compaction.Revision)
+
+6. func (s *store) Compact(trace *traceutil.Trace, rev int64) (<-chan struct{}, error)
+
+7. func (s *store) compact(trace *traceutil.Trace, rev int64) (<-chan struct{}, error)
+
+8. func (ti *treeIndex) Compact(rev int64) map[revision]struct{}
+
+9. func (s *store) scheduleCompaction(compactMainRev int64, keep map[revision]struct{})
+```
+6. 关键的数据结构，如下所示
+```
+type store struct {
+    ReadView
+    WriteView
+
+    cfg StoreConfig
+
+    // mu read locks for txns and write locks for non-txn store changes.
+    mu sync.RWMutex
+	// 这个字段是通过func NewConsistentIndex(tx backend.BatchTx)函数创建的
+    ci cindex.ConsistentIndexer
+	// 这个字段是通过func newBackend(cfg ServerConfig)函数创建的
+    b       backend.Backend
+	// 这个字段是通过func newTreeIndex(lg *zap.Logger)函数创建的
+    kvindex index
+	// 这个字段是通过func NewLessor(lg *zap.Logger, b backend.Backend, cfg LessorConfig, ci cindex.ConsistentIndexer)函数创建的
+    le lease.Lessor
+
+    // revMuLock protects currentRev and compactMainRev.
+    // Locked at end of write txn and released after write txn unlock lock.
+    // Locked before locking read txn and released after locking.
+    revMu sync.RWMutex
+    // currentRev is the revision of the last completed transaction.
+    currentRev int64
+    // compactMainRev is the main revision of the last compaction.
+    compactMainRev int64
+
+    fifoSched schedule.Scheduler
+
+    stopc chan struct{}
+
+    lg *zap.Logger
+}
+```
+
+
+# 六. 日志模块
+## 日志复制流程
+1. leader节点收到提议请求，首先通过func (r *raft) appendEntry(es ...pb.Entry)函数将日志保存到本地，如下所示：
+```
+func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
+    li := r.raftLog.lastIndex()
+    for i := range es {
+        es[i].Term = r.Term
+        es[i].Index = li + 1 + uint64(i)
+    }
+    // Track the size of this uncommitted proposal.
+    if !r.increaseUncommittedSize(es) {
+        r.logger.Debugf(
+            "%x appending new entries to log would exceed uncommitted entry size limit; dropping proposal",
+            r.id,
+        )
+        // Drop the proposal.
+        return false
+    }
+    // use latest "last" index after truncate/append
+    li = r.raftLog.append(es...)
+    r.prs.Progress[r.id].MaybeUpdate(li)
+    // Regardless of maybeCommit's return, our caller will call bcastAppend.
+    r.maybeCommit()
+    return true
+}
+```
+2. follower节点收到日志复制消息，会通过func (r *raft) handleAppendEntries(m pb.Message)函数将日志保存到本地，如下所示：
+```
+func (r *raft) handleAppendEntries(m pb.Message) {
+    if m.Index < r.raftLog.committed {
+        r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
+        return
+    }
+
+    if mlastIndex, ok := r.raftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...); ok {
+        r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: mlastIndex})
+    } else {
+        r.logger.Debugf("%x [logterm: %d, index: %d] rejected MsgApp [logterm: %d, index: %d] from %x",
+            r.id, r.raftLog.zeroTermOnErrCompacted(r.raftLog.term(m.Index)), m.Index, m.LogTerm, m.Index, m.From)
+        r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: m.Index, Reject: true, RejectHint: r.raftLog.lastIndex()})
+    }
+}
+```
+3. follower节点在向leader节点回复pb.MsgAppResp消息之前，会将日志落地到WAL模块，并且也会写入内存中的稳定日志结构，如下所示：
+```
+// gofail: var raftBeforeSave struct{}
+if err := r.storage.Save(rd.HardState, rd.Entries); err != nil {
+    .lg.Fatal("failed to save Raft hard state and entries", zap.Error(err))
+}
+
+// 写入内存中的稳定日志结构。
+r.raftStorage.Append(rd.Entries)
+```
+4. leader节点收到pb.MsgAppResp消息后，首先更新follower节点的日志进度，然后判断是否达到多数派确认，如果多数派确认了并且日志term等于自身term，则更新可提交的日志索引committed，如下所示：
+```
+pr := r.prs.Progress[m.From]
+pr.MaybeUpdate(m.Index)
+
+// maybeCommit attempts to advance the commit index. Returns true if
+// the commit index changed (in which case the caller should call
+// r.bcastAppend).
+func (r *raft) maybeCommit() bool {
+    mci := r.prs.Committed()
+    return r.raftLog.maybeCommit(mci, r.Term)
+}
+
+func (l *raftLog) maybeCommit(maxIndex, term uint64) bool {
+    if maxIndex > l.committed && l.zeroTermOnErrCompacted(l.term(maxIndex)) == term {
+        l.commitTo(maxIndex)
+        return true
+    }
+    return false
+}
+```
+## 日志的管理
+emsp;&emsp;&日志管理对象主要分三种，其中两种在内存中管理，主要分为unstable和Storage对象，第三种是wal日志文件。unstable对象的作用是发送提交请求到follower节点前，管理请求日志，在发送日志复制请求之前，这些日志是不需要持久化的，所以放在内存中管理，也有利于做批量的日志复制。Storage对象的作用是在内存中维护一份已经持久化好的日志，因为wal日志文件的读取性能不高，只负责持久化日志并在重启时恢复。内存中的日志管理对象，初始化如下。当日志应用到状态机之后，会通过r.raftLog.stableTo(e.Index, e.Term)销毁unstable中的日志。
+```
+s = raft.NewMemoryStorage()   // 这个对象负责存储内存中的stable日志
+c := &raft.Config{
+    ID:              uint64(id),
+    ElectionTick:    cfg.ElectionTicks,
+    HeartbeatTick:   1,
+    Storage:         s,
+    MaxSizePerMsg:   maxSizePerMsg,
+    MaxInflightMsgs: maxInflightMsgs,
+    CheckQuorum:     true,
+    PreVote:         cfg.PreVote,
+}
+raftlog := newLogWithSize(c.Storage, c.Logger, c.MaxCommittedSizePerReady)
+r := &raft{
+    id:                        c.ID,
+    lead:                      None,
+    isLearner:                 false,
+    raftLog:                   raftlog,  // 这个对象负责存储内存中的unstable以及stable日志
+    maxMsgSize:                c.MaxSizePerMsg,
+    maxUncommittedSize:        c.MaxUncommittedEntriesSize,
+    prs:                       tracker.MakeProgressTracker(c.MaxInflightMsgs),
+    electionTimeout:           c.ElectionTick,
+    heartbeatTimeout:          c.HeartbeatTick,
+    logger:                    c.Logger,
+    checkQuorum:               c.CheckQuorum,
+    preVote:                   c.PreVote,
+    readOnly:                  newReadOnly(c.ReadOnlyOption),
+    disableProposalForwarding: c.DisableProposalForwarding,
+}
+
+type raftLog struct {
+    // storage contains all stable entries since the last snapshot.
+    storage Storage
+
+    // unstable contains all unstable entries and snapshot.
+    // they will be saved into storage.
+    unstable unstable
+
+    // committed is the highest log position that is known to be in
+    // stable storage on a quorum of nodes.
+    committed uint64
+    // applied is the highest log position that the application has
+    // been instructed to apply to its state machine.
+    // Invariant: applied <= committed
+    applied uint64
+
+    logger Logger
+
+    // maxNextEntsSize is the maximum number aggregate byte size of the messages
+    // returned from calls to nextEnts.
+    maxNextEntsSize uint64
+}
+```
+&emsp;&emsp;持久化到文件的日志管理对象，初始化如下：
+```
+// 负责写snapshot文件的对象
+ss := snap.New(cfg.Logger, cfg.SnapDir())
+
+srv = &EtcdServer{
+    readych:     make(chan struct{}),
+    Cfg:         cfg,
+    lgMu:        new(sync.RWMutex),
+    lg:          cfg.Logger,
+    errorc:      make(chan error, 1),
+    v2store:     st,
+    snapshotter: ss,
+    r: *newRaftNode(
+        raftNodeConfig{
+            lg:          cfg.Logger,
+            isIDRemoved: func(id uint64) bool { return cl.IsIDRemoved(types.ID(id)) },
+            Node:        n,
+            heartbeat:   heartbeat,
+            raftStorage: s,   // 这个对象负责存储内存中的stable日志
+            storage:     NewStorage(w, ss),  // 这个对象负责写wal日志和snapshot文件
+        },
+    ),
+    id:               id,
+    attributes:       membership.Attributes{Name: cfg.Name, ClientURLs: cfg.ClientURLs.StringSlice()},
+    cluster:          cl,
+    stats:            sstats,
+    lstats:           lstats,
+    SyncTicker:       time.NewTicker(500 * time.Millisecond),
+    peerRt:           prt,
+    reqIDGen:         idutil.NewGenerator(uint16(id), time.Now()),
+    forceVersionC:    make(chan struct{}),
+    AccessController: &AccessController{CORS: cfg.CORS, HostWhitelist: cfg.HostWhitelist},
+    consistIndex:     cindex.NewConsistentIndex(be.BatchTx()),
+}
+
+
+func NewStorage(w *wal.WAL, s *snap.Snapshotter) Storage {
+    return &storage{w, s}
+}
+```
+## 日志的压缩
+1. v2版本的数据压缩，代码如下：
+```
+1. func (s *EtcdServer) applyAll(ep *etcdProgress, apply *apply)
+
+2. func (s *EtcdServer) triggerSnapshot(ep *etcdProgress)
+
+3. func (s *EtcdServer) snapshot(snapi uint64, confState raftpb.ConfState)
+
+4. func (ms *MemoryStorage) CreateSnapshot(i uint64, cs *pb.ConfState, data []byte) (pb.Snapshot, error)
+
+5. func (s *EtcdServer) purgeFile()
+```
+2. v3版本的数据压缩：一般情况下，v3版本的数据不需要生成历史数据的快照。但如果follower节点进度比较落后，leader节点在复制日志的时候，leader将v2版本的snapshot数据 + 当前boltdb的数据 合并成一个MergedSnapshot发送给follower。follower节点收到后依次恢复v2和v3版本的数据，此时v2和v3版本数据的进度存在不一致（v3版本的数据比较新），随后v2版本的数据通过日志回放追赶上，而v3版本的数据通过boltdb中的consistentIndex确保日志回放的幂等性。代码如下：
+```
+// 日志复制的时候，如果日志已被压缩，则发送MsgSnap消息给follower
+1. func (r *raft) maybeSendAppend(to uint64, sendIfEmpty bool)
+
+// leader节点发消息给follower之前，对于MsgSnap类型的消息，先将该msg塞到r.msgSnapC通道中，然后通过ms[i].To = 0清掉目标follower。
+2. func (r *raftNode) processMessages(ms []raftpb.Message)
+
+// 发消息接口会忽略掉ms[i].To为0的消息
+3. func (t *Transport) Send(msgs []raftpb.Message)
+
+// 该函数通过select监听到r.msgSnapC有可读消息，
+4. func (s *EtcdServer) applyAll(ep *etcdProgress, apply *apply)
+
+// leader通过将当前v2版本的snapshot数据 + 当前boltdb的数据 合并成一个MergedSnapshot发送给follower。其中boltdb的数据是通过开启一个读事务，然后创建一个pipe管道，读事务每次最多从boltdb文件读取32K写入到pipe的write端，另一个协程则与读事务协程交替着读取、写入pipe，读取pipe内容后，通过http的流式传输发送给follower
+5. func (s *EtcdServer) createMergedSnapshotMessage(m raftpb.Message, snapt, snapi uint64, confState raftpb.ConfState)
+
+// 发送MergedSnapshot数据给follower，该消息的类型为MsgSnap
+6. func (s *EtcdServer) sendMergedSnap(merged snap.Message)
+
+// 发送/raft/snapshot路径的post请求
+7. func (s *snapshotSender) send(merged snap.Message)
+
+// follower节点对/raft/snapshot路径http请求的处理函数。这个函数会生成boltdb的快照文件，然后调用Process处理该条消息，该消息的类型为MsgSnap
+8. func (h *snapshotHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
+
+// 根据MsgSnap消息恢复follwer节点的unstable日志数据，此时unstable日志中会保存该v2版本的数据快照
+9. func (r *raft) handleSnapshot(m pb.Message)
+
+// 最后这个unstable日志中的快照数据会装载到ready结构中，然后调用func (s *EtcdServer) applyAll(ep *etcdProgress, apply *apply)函数
+10. func (s *EtcdServer) applyAll(ep *etcdProgress, apply *apply)
+
+// 通过snapshot恢复boltdb（这个恢复过程中用到了前面生成的boltdb的快照文件），然后也恢复下v2store存储
+11. func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply)
+```
+
+# 七. 写请求的处理流程
 1. func (s \*EtcdServer) Put(ctx context.Context, r \*pb.PutRequest) (*pb.PutResponse, error)
 2. func (s *EtcdServer) processInternalRaftRequestOnce(ctx context.Context, r pb.InternalRaftRequest)
 3. func (n *node) Propose(ctx context.Context, data []byte)函数将该消息发送到node.propc通道中，然后等待pm.result的结果。
@@ -516,3 +960,589 @@ func (t *Transport) Handler() http.Handler {
 11. leader节点通过func stepLeader(r *raft, m pb.Message)函数处理pb.MsgAppResp消息，如果多数派复制ok则说明日志可提交，然后再广播pb.MsgApp消息给所有follower（因为需要让follower立马知道有新的日志可提交）。如果某个节点复制日志失败，则调整该follower节点的复制进度next后重新发送pb.MsgApp消息。日志提交之后，会通过func (n *node) run()函数打包成ready数据，并push到node.readyc通道中。
 12. func (r *raftNode) start(rh *raftReadyHandler)函数会读取ready数据，将待应用到状态机的日志发送到raftNode.applyc通道中。
 13. func (s *EtcdServer) run()函数会读取r.applyc通道中的日志，通过func (s *EtcdServer) applyAll(ep *etcdProgress, apply *apply)函数应用到存储状态机。
+
+# 八. 读请求的处理流程
+```
+1. func (s *EtcdServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeResponse, error)
+
+2. func (a *applierV3backend) Range(ctx context.Context, txn mvcc.TxnRead, r *pb.RangeRequest) (*pb.RangeResponse, error)
+
+func (s *store) Read(trace *traceutil.Trace) TxnRead {
+    s.mu.RLock()
+    s.revMu.RLock()
+    // backend holds b.readTx.RLock() only when creating the concurrentReadTx. After
+    // ConcurrentReadTx is created, it will not block write transaction.
+    tx := s.b.ConcurrentReadTx()
+    tx.RLock() // RLock is no-op. concurrentReadTx does not need to be locked after it is created.
+    firstRev, rev := s.compactMainRev, s.currentRev
+    s.revMu.RUnlock()
+    return newMetricsTxnRead(&amp;storeTxnRead{s, tx, firstRev, rev, trace})
+}
+
+// ConcurrentReadTx creates and returns a new ReadTx, which:
+// A) creates and keeps a copy of backend.readTx.txReadBuffer,
+// B) references the boltdb read Tx (and its bucket cache) of current batch interval.
+func (b *backend) ConcurrentReadTx() ReadTx {
+    b.readTx.RLock()
+    defer b.readTx.RUnlock()
+    // prevent boltdb read Tx from been rolled back until store read Tx is done. Needs to be called when holding readTx.RLock().
+    b.readTx.txWg.Add(1)
+    // TODO: might want to copy the read buffer lazily - create copy when A) end of a write transaction B) end of a batch interval.
+    return &concurrentReadTx{
+        buf:     b.readTx.buf.unsafeCopy(),
+        tx:      b.readTx.tx,
+        txMu:    &b.readTx.txMu,
+        buckets: b.readTx.buckets,
+        txWg:    b.readTx.txWg,
+    }
+}
+
+3. func (tw *metricsTxnWrite) Range(key, end []byte, ro RangeOptions) (*RangeResult, error)
+
+4. func (tr *storeTxnRead) Range(key, end []byte, ro RangeOptions) (r *RangeResult, err error)
+
+// 首先通过keyIndex获取到相关的所有版本号，然后再根据每个版本号读取数据
+5. func (tr *storeTxnRead) rangeKeys(key, end []byte, curRev int64, ro RangeOptions) (*RangeResult, error)
+
+// 结合txReadBuffer和boltdb，读取数据
+6. func (rt *concurrentReadTx) UnsafeRange(bucketName, key, endKey []byte, limit int64) ([][]byte, [][]byte)
+```
+
+## 九. 租约的实现
+1. 租约相关的api接口，如下所示：
+```
+pb.RegisterLeaseServer(grpcServer, NewQuotaLeaseServer(s))
+
+var _Lease_serviceDesc = grpc.ServiceDesc{
+    ServiceName: "etcdserverpb.Lease",
+    HandlerType: (*LeaseServer)(nil),
+    Methods: []grpc.MethodDesc{
+        {
+            MethodName: "LeaseGrant",
+            Handler:    _Lease_LeaseGrant_Handler,
+        },
+        {
+            MethodName: "LeaseRevoke",
+            Handler:    _Lease_LeaseRevoke_Handler,
+        },
+        {
+            MethodName: "LeaseTimeToLive",
+            Handler:    _Lease_LeaseTimeToLive_Handler,
+        },
+        {
+            MethodName: "LeaseLeases",
+            Handler:    _Lease_LeaseLeases_Handler,
+        },
+    },
+    Streams: []grpc.StreamDesc{
+        {
+            StreamName:    "LeaseKeepAlive",
+            Handler:       _Lease_LeaseKeepAlive_Handler,
+            ServerStreams: true,
+            ClientStreams: true,
+        },
+    },
+    Metadata: "rpc.proto",
+}
+
+func (ls *LeaseServer) LeaseGrant(ctx context.Context, cr *pb.LeaseGrantRequest) (*pb.LeaseGrantResponse, error)
+
+func (s *EtcdServer) LeaseGrant(ctx context.Context, r *pb.LeaseGrantRequest) (*pb.LeaseGrantResponse, error)
+
+func (ls *LeaseServer) LeaseRevoke(ctx context.Context, rr *pb.LeaseRevokeRequest) (*pb.LeaseRevokeResponse, error)
+
+func (s *EtcdServer) LeaseRevoke(ctx context.Context, r *pb.LeaseRevokeRequest) (*pb.LeaseRevokeResponse, error)
+
+func (ls *LeaseServer) LeaseTimeToLive(ctx context.Context, rr *pb.LeaseTimeToLiveRequest) (*pb.LeaseTimeToLiveResponse, error)
+
+func (s *EtcdServer) LeaseTimeToLive(ctx context.Context, r *pb.LeaseTimeToLiveRequest) (*pb.LeaseTimeToLiveResponse, error)
+
+func (ls *LeaseServer) LeaseLeases(ctx context.Context, rr *pb.LeaseLeasesRequest) (*pb.LeaseLeasesResponse, error)
+
+func (s *EtcdServer) LeaseLeases(ctx context.Context, r *pb.LeaseLeasesRequest) (*pb.LeaseLeasesResponse, error)
+
+func (ls *LeaseServer) LeaseKeepAlive(stream pb.Lease_LeaseKeepAliveServer)
+```
+2. 租约管理实例的初始化
+```
+srv.lessor = lease.NewLessor(
+        srv.getLogger(),
+        srv.be,
+        lease.LessorConfig{
+            MinLeaseTTL:                int64(math.Ceil(minTTL.Seconds())),
+            CheckpointInterval:         cfg.LeaseCheckpointInterval,
+            ExpiredLeasesRetryInterval: srv.Cfg.ReqTimeout(),
+        },
+        srv.consistIndex,
+    )
+	
+func NewStore(lg *zap.Logger, b backend.Backend, le lease.Lessor, ci cindex.ConsistentIndexer, cfg StoreConfig) *store {
+    s := &store{
+        cfg:     cfg,
+        b:       b,
+        ci:      ci,
+        kvindex: newTreeIndex(lg),
+
+        le: le,
+
+        currentRev:     1,
+        compactMainRev: -1,
+
+        fifoSched: schedule.NewFIFOScheduler(),
+
+        stopc: make(chan struct{}),
+
+        lg: lg,
+    }
+	// 省略若干代码
+    return s
+}
+```
+3. 生成租约的代码流程如下：
+```
+// 生成一个请求：pb.InternalRaftRequest{LeaseGrant: r}
+1. func (s *EtcdServer) LeaseGrant(ctx context.Context, r *pb.LeaseGrantRequest) (*pb.LeaseGrantResponse, error)
+
+2. func (s *EtcdServer) raftRequestOnce(ctx context.Context, r pb.InternalRaftRequest) (proto.Message, error)
+
+3. func (s *EtcdServer) processInternalRaftRequestOnce(ctx context.Context, r pb.InternalRaftRequest) (*applyResult, error)
+
+func (n *node) Propose(ctx context.Context, data []byte) error {
+    return n.stepWait(ctx, pb.Message{Type: pb.MsgProp, Entries: []pb.Entry{{Data: data}}})
+}
+
+// 经过raft算法达成一致后，通过func (s *EtcdServer) applyEntryNormal(e *raftpb.Entry)应用到状态机
+4. func (a *applierV3backend) Apply(r *pb.InternalRaftRequest)
+5. func (a *applierV3backend) LeaseGrant(lc *pb.LeaseGrantRequest) (*pb.LeaseGrantResponse, error)
+
+6. func (le *lessor) Grant(id LeaseID, ttl int64) (*Lease, error)
+```
+4. 根据租约ID撤销租约的代码流程如下：
+```
+// 生成一个请求：pb.InternalRaftRequest{LeaseRevoke: r}
+1. func (s *EtcdServer) LeaseRevoke(ctx context.Context, r *pb.LeaseRevokeRequest) (*pb.LeaseRevokeResponse, error)
+
+2. func (s *EtcdServer) raftRequestOnce(ctx context.Context, r pb.InternalRaftRequest) (proto.Message, error)
+
+3. func (s *EtcdServer) processInternalRaftRequestOnce(ctx context.Context, r pb.InternalRaftRequest) (*applyResult, error)
+
+// 经过raft算法达成一致后，通过func (s *EtcdServer) applyEntryNormal(e *raftpb.Entry)应用到状态机
+4. func (a *applierV3backend) Apply(r *pb.InternalRaftRequest)
+
+5. func (a *applierV3backend) LeaseRevoke(lc *pb.LeaseRevokeRequest) (*pb.LeaseRevokeResponse, error)
+
+6. func (le *lessor) Revoke(id LeaseID)
+```
+5. 根据租约ID查询租约的剩余生命周期（可以指定回包是否带上关联该租约ID的key列表），代码如下：
+```
+1. func (s *EtcdServer) LeaseTimeToLive(ctx context.Context, r *pb.LeaseTimeToLiveRequest) (*pb.LeaseTimeToLiveResponse, error)
+// 如果leader节点收到请求则直接查询，如果是其它节点收到则转发给leader节点处理
+2. func (le *lessor) Lookup(id LeaseID) *Lease
+```
+6. 查看目前存在的所有租约ID
+```
+1. func (s *EtcdServer) LeaseLeases(ctx context.Context, r *pb.LeaseLeasesRequest) (*pb.LeaseLeasesResponse, error)
+
+2. func (le *lessor) Leases() []*Lease
+```
+7. 为数据key附上租约的代码流程
+```
+// raft日志应用到状态机，key-value写入存储层时boltdb底层存储版本号对应的value时，value包含租约ID，用于重启时恢复
+func (tw *storeTxnWrite) put(key, value []byte, leaseID lease.LeaseID) {
+	// 省略若干代码
+	kv := mvccpb.KeyValue{
+        Key:            key,
+        Value:          value,
+        CreateRevision: c,
+        ModRevision:    rev,
+        Version:        ver,
+        Lease:          int64(leaseID),
+    }
+	
+	if leaseID != lease.NoLease {
+        if tw.s.le == nil {
+            panic("no lessor to attach lease")
+        }
+        err = tw.s.le.Attach(leaseID, []lease.LeaseItem{{Key: string(key)}})
+        if err != nil {
+            panic("unexpected error from lease Attach")
+        }
+    }
+}
+
+func (le *lessor) Attach(id LeaseID, items []LeaseItem) error {
+    le.mu.Lock()
+    defer le.mu.Unlock()
+
+    l := le.leaseMap[id]
+    if l == nil {
+        return ErrLeaseNotFound
+    }
+
+    l.mu.Lock()
+    for _, it := range items {
+        l.itemSet[it] = struct{}{}
+        le.itemMap[it] = id
+    }
+    l.mu.Unlock()
+    return nil
+}
+```
+8. 租约的checkpoint实现：checkpoint的处理钩子函数在etcd初始化时就设置了，其实现的代码流程如下：
+```
+srv.lessor.SetCheckpointer(func(ctx context.Context, cp *pb.LeaseCheckpointRequest) {
+            srv.raftRequestOnce(ctx, pb.InternalRaftRequest{LeaseCheckpoint: cp})
+        })
+```
+```
+srv.lessor = lease.NewLessor(
+        srv.getLogger(),
+        srv.be,
+        lease.LessorConfig{
+            MinLeaseTTL:                int64(math.Ceil(minTTL.Seconds())),
+            CheckpointInterval:         cfg.LeaseCheckpointInterval,
+            ExpiredLeasesRetryInterval: srv.Cfg.ReqTimeout(),
+        },
+        srv.consistIndex,
+    )
+	
+func NewStore(lg *zap.Logger, b backend.Backend, le lease.Lessor, ci cindex.ConsistentIndexer, cfg StoreConfig) *store {
+    s := &store{
+        cfg:     cfg,
+        b:       b,
+        ci:      ci,
+        kvindex: newTreeIndex(lg),
+
+        le: le,
+
+        currentRev:     1,
+        compactMainRev: -1,
+
+        fifoSched: schedule.NewFIFOScheduler(),
+
+        stopc: make(chan struct{}),
+
+        lg: lg,
+    }
+	// 省略若干代码
+    return s
+}
+```
+9. 租约过期检查的流程
+```
+// 每500ms运行一次逻辑
+1. func (le *lessor) runLoop()
+// 从最小堆中获取当前已过期的租约，只有leader节点才有这个逻辑
+2. func (le *lessor) revokeExpiredLeases()
+// 最多返回leaseRevokeRate / 2个租约，对于过期的租约会在堆中重新更新它的过期时间（过期时间 = 当前时间 + expiredLeaseRetryInterval，用于失败重试机制）
+3. func (le *lessor) findExpiredLeases(limit int) []*Lease
+
+4. 将获取到的过期租约列表写入le.expiredC通道
+
+// 这个函数会读取le.expiredC通道，并且对于每个过期租约，生成一个raft请求：pb.LeaseRevokeRequest{ID: int64(lid)}
+5. func (s *EtcdServer) run()
+
+// 经过raft算法达成一致后，通过func (s *EtcdServer) applyEntryNormal(e *raftpb.Entry)应用到状态机
+6. func (a *applierV3backend) Apply(r *pb.InternalRaftRequest) *applyResult
+
+7. func (le *lessor) Revoke(id LeaseID)
+```
+10. 租约保活机制的流程
+```
+1. func _Lease_LeaseKeepAlive_Handler(srv interface{}, stream grpc.ServerStream)
+
+2. func (ls *LeaseServer) LeaseKeepAlive(stream pb.Lease_LeaseKeepAliveServer)
+
+// 不断地收到客户端的请求，server端则不断地更新租约的过期时间
+3. func (ls *LeaseServer) leaseKeepAlive(stream pb.Lease_LeaseKeepAliveServer)
+
+4. func (s *EtcdServer) LeaseRenew(ctx context.Context, id lease.LeaseID)
+
+// leader节点直接处理，非leader节点将续期请求转发给leader节点
+5. func (le *lessor) Renew(id LeaseID)
+```
+
+
+# 十. watch机制
+1. watch存储实例的初始化
+```
+srv.kv = mvcc.New(srv.getLogger(), srv.be, srv.lessor, srv.consistIndex, mvcc.StoreConfig{CompactionBatchLimit: cfg.CompactionBatchLimit})
+
+func newWatchableStore(lg *zap.Logger, b backend.Backend, le lease.Lessor, ci cindex.ConsistentIndexer, cfg StoreConfig) *watchableStore {
+    if lg == nil {
+        lg = zap.NewNop()
+    }
+    s := &watchableStore{
+        store:    NewStore(lg, b, le, ci, cfg),  // 提供mvcc的存储机制
+        victimc:  make(chan struct{}, 1),
+        unsynced: newWatcherGroup(),
+        synced:   newWatcherGroup(),
+        stopc:    make(chan struct{}),
+    }
+    s.store.ReadView = &readView{s}
+    s.store.WriteView = &writeView{s}
+    if s.le != nil {
+        // use this store as the deleter so revokes trigger watch events
+        s.le.SetRangeDeleter(func() lease.TxnDelete { return s.Write(traceutil.TODO()) })
+    }
+    s.wg.Add(2)
+    go s.syncWatchersLoop()
+    go s.syncVictimsLoop()
+    return s
+}
+
+func NewStore(lg *zap.Logger, b backend.Backend, le lease.Lessor, ci cindex.ConsistentIndexer, cfg StoreConfig) *store {
+    if lg == nil {
+        lg = zap.NewNop()
+    }
+    if cfg.CompactionBatchLimit == 0 {
+        cfg.CompactionBatchLimit = defaultCompactBatchLimit
+    }
+    s := &store{
+        cfg:     cfg,
+        b:       b,   // 底层是boltdb实现
+        ci:      ci,
+        kvindex: newTreeIndex(lg),  // B树维护key的版本号列表信息
+
+        le: le,
+
+        currentRev:     1,
+        compactMainRev: -1,
+
+        fifoSched: schedule.NewFIFOScheduler(),
+
+        stopc: make(chan struct{}),
+
+        lg: lg,
+    }
+    s.ReadView = &readView{s}
+    s.WriteView = &writeView{s}
+    if s.le != nil {
+        s.le.SetRangeDeleter(func() lease.TxnDelete { return s.Write(traceutil.TODO()) })
+    }
+
+    tx := s.b.BatchTx()
+    tx.Lock()
+    tx.UnsafeCreateBucket(keyBucketName)
+    tx.UnsafeCreateBucket(metaBucketName)
+    tx.Unlock()
+    s.b.ForceCommit()
+
+    s.mu.Lock()
+    defer s.mu.Unlock()
+	// 根据boltdb数据恢复kvindex的B树索引
+    if err := s.restore(); err != nil {
+        // TODO: return the error instead of panic here?
+        panic("failed to recover store from backend")
+    }
+
+    return s
+}
+```
+2. watch请求的处理流程
+&emsp;&emsp;注册处理watch请求的watch handle函数
+```
+func StartEtcd(inCfg *Config) (e *Etcd, err error)
+func (e *Etcd) serveClients() (err error)
+func (sctx *serveCtx) serve(
+    s *etcdserver.EtcdServer,
+    tlsinfo *transport.TLSInfo,
+    handler http.Handler,
+    errHandler func(error),
+    gopts ...grpc.ServerOption) (err error)
+	
+func Server(s *etcdserver.EtcdServer, tls *tls.Config, gopts ...grpc.ServerOption) *grpc.Server
+pb.RegisterWatchServer(grpcServer, NewWatchServer(s))
+
+var _Watch_serviceDesc = grpc.ServiceDesc{
+    ServiceName: "etcdserverpb.Watch",
+    HandlerType: (*WatchServer)(nil),
+    Methods:     []grpc.MethodDesc{},
+    Streams: []grpc.StreamDesc{
+        {
+            StreamName:    "Watch",
+            Handler:       _Watch_Watch_Handler,
+            ServerStreams: true,
+            ClientStreams: true,
+        },
+    },
+    Metadata: "rpc.proto",
+}
+func RegisterWatchServer(s *grpc.Server, srv WatchServer) {
+    s.RegisterService(&_Watch_serviceDesc, srv)
+}
+
+func _Watch_Watch_Handler(srv interface{}, stream grpc.ServerStream) error {
+    return srv.(WatchServer).Watch(&watchWatchServer{stream})
+}
+```
+&emsp;&emsp;watch handle函数的处理流程
+```
+func (ws *watchServer) Watch(stream pb.Watch_WatchServer)
+
+func (sws *serverWatchStream) recvLoop()
+
+func (ws *watchStream) Watch(id WatchID, key, end []byte, startRev int64, fcs ...FilterFunc)
+
+func (s *watchableStore) watch(key, end []byte, startRev int64, id WatchID, ch chan<- WatchResponse, fcs ...FilterFunc) (*watcher, cancelFunc)
+```
+&emsp;&emsp;watch变更事件的生成、通知流程
+```
+// 先构造一个TxnWrite
+func (s *store) Write(trace *traceutil.Trace) TxnWrite
+
+// 写请求结束后，会将本次所有的数据变更打包成Event事件列表
+func (tw *watchableStoreTxnWrite) End()
+
+// 根据Event事件筛选出相关的watcher，然后依次通知给各个watcher
+func (s *watchableStore) notify(rev int64, evs []mvccpb.Event)
+
+// 将Event事件写入到watcher的通道中，这个通道其实就是watchStream的通道，并且这个通道可以由多个watcher共享（1个客户端可以创建多个watcher）
+func (w *watcher) send(wr WatchResponse)
+
+// 将每个watcher的Event事件依次通过gRPCStream发给客户端
+func (sws *serverWatchStream) sendLoop()
+
+func (x *watchWatchServer) Send(m *WatchResponse)
+```
+
+## 十一. 成员变更
+1. 成员变更的api接口：首先是注册http api接口，其次是ClusterServer结构实现具体接口
+```
+var _Cluster_serviceDesc = grpc.ServiceDesc{
+    ServiceName: "etcdserverpb.Cluster",
+    HandlerType: (*ClusterServer)(nil),
+    Methods: []grpc.MethodDesc{
+        {
+            MethodName: "MemberAdd",
+            Handler:    _Cluster_MemberAdd_Handler,
+        },
+        {
+            MethodName: "MemberRemove",
+            Handler:    _Cluster_MemberRemove_Handler,
+        },
+        {
+            MethodName: "MemberUpdate",
+            Handler:    _Cluster_MemberUpdate_Handler,
+        },
+        {
+            MethodName: "MemberList",
+            Handler:    _Cluster_MemberList_Handler,
+        },
+        {
+            MethodName: "MemberPromote",
+            Handler:    _Cluster_MemberPromote_Handler,
+        },
+    },
+    Streams:  []grpc.StreamDesc{},
+    Metadata: "rpc.proto",
+}
+```
+```
+pb.RegisterClusterServer(grpcServer, NewClusterServer(s))
+
+// 往集群添加1个节点
+func (cs *ClusterServer) MemberAdd(ctx context.Context, r *pb.MemberAddRequest) (*pb.MemberAddResponse, error)
+
+// 集群移除1个节点
+func (cs *ClusterServer) MemberRemove(ctx context.Context, r *pb.MemberRemoveRequest) (*pb.MemberRemoveResponse, error)
+
+// 更新集群中的某个节点
+func (cs *ClusterServer) MemberUpdate(ctx context.Context, r *pb.MemberUpdateRequest) (*pb.MemberUpdateResponse, error)
+```
+```
+// EtcdServer层实现具体逻辑
+func (s *EtcdServer) AddMember(ctx context.Context, memb membership.Member) ([]*membership.Member, error)
+
+func (s *EtcdServer) RemoveMember(ctx context.Context, id uint64) ([]*membership.Member, error)
+```
+2. 成员变更的代码流程，如下：
+```
+// leader节点收到成员变更的提交请求，将其当成普通日志一样，先append到unstable日志，广播给follower后再刷到wal日志文件中。另外，如果发现上一次的成员变更尚未完成则会忽略本次成员变更
+1. func stepLeader(r *raft, m pb.Message)
+
+// follower节点收到日志复制请求，也将其当成普通日志一样，先append到unstable日志
+2. func stepFollower(r *raft, m pb.Message)
+
+// follower节点处理ready结构时，如果发现可提交的日志中存在成员变更日志，则需要同步等待这些可提交日志全部应用到状态机中才能将msg发送出去
+3. func (r *raftNode) start(rh *raftReadyHandler)
+
+// leader节点判断日志已复制到多数派，则更新commit_index。如果是联合共识状态，此时这个函数会取2个多数派中较小的那个commit_index
+4. func (r *raft) maybeCommit()
+
+// 将可提交的日志打包到ready结构中
+5. func newReady(r *raft, prevSoftSt *SoftState, prevHardSt pb.HardState)
+
+// 将可提交的日志应用到状态机，接着调用func (s *EtcdServer) apply函数，从这个函数可以看到etcd只支持raftpb.EntryConfChange类型的单成员变更
+6. func (s *EtcdServer) applyAll(ep *etcdProgress, apply *apply)
+
+// 对于成员变更，则调用这个函数。这个函数校验成员变更请求通过，将变更请求push到node.confc通道中。func (n *node) run()函数会消费这个成员变更请求更新集群的成员配置。applyConfChange函数一定会等到func (n *node) run()函数处理完毕后才会继续apply后续的日志
+7. func (s *EtcdServer) applyConfChange(cc raftpb.ConfChange, confState *raftpb.ConfState)
+```
+&emsp;&emsp;将成员变更日志apply时，如果是需要进入联合共识状态，则会创建出Cold和Cnew两个多数派；如果是需要离开联合共识状态，则会清掉Cold那个多数派，最终只留下Cnew这一个多数派。代码如下：
+```
+func (r *raft) applyConfChange(cc pb.ConfChangeV2) pb.ConfState {
+    cfg, prs, err := func() (tracker.Config, tracker.ProgressMap, error) {
+        changer := confchange.Changer{
+            Tracker:   r.prs,
+            LastIndex: r.raftLog.lastIndex(),
+        }
+        if cc.LeaveJoint() {
+            return changer.LeaveJoint()
+        } else if autoLeave, ok := cc.EnterJoint(); ok {
+            return changer.EnterJoint(autoLeave, cc.Changes...)
+        }
+        return changer.Simple(cc.Changes...)
+    }()
+
+    if err != nil {
+        // TODO(tbg): return the error to the caller.
+        panic(err)
+    }
+
+    return r.switchToConfig(cfg, prs)
+}
+```
+&emsp;&emsp;leader节点复制日志消息的时候，根据当前Cold和Cnew的并集去广播消息。
+&emsp;&emsp;如果是自动离开join consensus状态，则leader在将join consensus的日志应用到状态机后，会自动创建一个空的日志变更请求。代码如下：
+```
+if r.prs.Config.AutoLeave && oldApplied < r.pendingConfIndex && newApplied >= r.pendingConfIndex && r.state == StateLeader {
+    // If the current (and most recent, at least for this leader's term)
+    // configuration should be auto-left, initiate that now. We use a
+    // nil Data which unmarshals into an empty ConfChangeV2 and has the
+    // benefit that appendEntry can never refuse it based on its size
+    // (which registers as zero).
+    ent := pb.Entry{
+        Type: pb.EntryConfChangeV2,
+        Data: nil,
+    }
+    // There's no way in which this proposal should be able to be rejected.
+    if !r.appendEntry(ent) {
+        panic("refused un-refusable auto-leaving ConfChangeV2")
+    }
+    r.pendingConfIndex = r.raftLog.lastIndex()
+    r.logger.Infof("initiating automatic transition out of joint configuration %s", r.prs.Config)
+}
+```
+3. 不在Cnew中的节点，如何退出服务
+&emsp;&emsp;func (s *EtcdServer) apply(es []raftpb.Entry,confState *raftpb.ConfState,) (appliedt uint64, appliedi uint64, shouldStop bool) 函数中，调用applyConfChange的返回值会告诉自身服务是否需要stop，如果需要stop则etcdserver会在1秒后退出，代码如下：
+```
+removedSelf, err := s.applyConfChange(cc, confState)
+
+var shouldstop bool
+    if ep.appliedt, ep.appliedi, shouldstop = s.apply(ents, &ep.confState); shouldstop {
+        go s.stopWithDelay(10*100*time.Millisecond, fmt.Errorf("the member has been permanently removed from the cluster"))
+    }
+	
+func (s *EtcdServer) stopWithDelay(d time.Duration, err error) {
+    select {
+    case <-time.After(d):
+    case <-s.done:
+    }
+    select {
+    case s.errorc <- err:
+    default:
+    }
+}
+```
+&emsp;&emsp;func (s *EtcdServer) run()函数，读取到s.errorc通道中的错误，就会退出。
