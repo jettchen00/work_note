@@ -1,4 +1,4 @@
-[toc]
+[TOC]
 # 1. Bucket实现
 ## 1.1 Bucket相关的数据结构
 ```

@@ -1,19 +1,33 @@
-[toc]
+[TOC]
 # 参考文档
 [彻底搞懂mvcc与watch](https://zhuanlan.zhihu.com/p/502786815)
+
 [boltdb 源码导读-数据组织](https://zhuanlan.zhihu.com/p/332439403)
+
 [boltdb 源码导读-索引设计](https://zhuanlan.zhihu.com/p/341416264)
+
 [boltdb 源码导读-事务实现](https://zhuanlan.zhihu.com/p/363795675)
+
 [自底向上分析 BoltDB 源码](https://www.bookstack.cn/books/jaydenwen123-boltdb_book)
+
 [boltdb源码阅读](https://mp.weixin.qq.com/s/QfcHJ7dazjRUSC3vCMuofQ)
+
 [Etcd Raft库的日志存储](https://www.codedump.info/post/20210628-etcd-wal/)
+
 [Etcd Raft库的工程化实现](https://www.codedump.info/post/20210515-raft/)
+
 [etcd中的Lease机制](https://www.cnblogs.com/ricklz/p/15232204.html)
+
 [万字长文解析 etcd 如何实现 watch 机制](https://zhuanlan.zhihu.com/p/502786815)
+
 [watch机制原理分析](https://www.lixueduan.com/post/etcd/05-watch/)
+
 [watch 机制源码分析](https://www.lixueduan.com/post/etcd/13-watch-analyze-1/)
+
 [Raft成员变更的工程实践](https://zhuanlan.zhihu.com/p/359206808)
+
 [etcd 3.5版本的joint consensus实现解析](https://www.codedump.info/post/20220101-etcd3.5-joint-consensus/)
+
 [etcd-raft的线性一致读](https://zhuanlan.zhihu.com/p/31050303)
 
 
